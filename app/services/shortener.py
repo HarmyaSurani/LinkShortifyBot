@@ -5,7 +5,6 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
-from app.db.database import db
 from app.services.api_client import api_client
 from app.utils.html_parser import extract_alias_links, extract_links, is_alias_format
 from app.utils.text_filters import (
@@ -83,9 +82,6 @@ async def _process_standard(
         if label == href:
             result = result.replace(label, short, 1)
 
-    if conversions:
-        await db.inc_links_shortened(len(conversions))
-
     return ProcessResult(text=result, link_type="standard", conversions=conversions)
 
 
@@ -115,9 +111,6 @@ async def _process_alias(html_text: str, api_key: str) -> ProcessResult:
         for item, res in zip(links, results)
         if res != item.get("url", "")
     ]
-    if conversions:
-        await db.inc_links_shortened(len(conversions))
-
     return ProcessResult(
         text="\n".join(results), link_type="alias", conversions=conversions
     )

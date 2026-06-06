@@ -62,6 +62,21 @@ async def _fetch_image(url: str) -> bytes | None:
     return None
 
 
+async def _reply_with_banner(message, caption: str, banner: str) -> bool:
+    """Reply with a banner photo. Tries the stored value (file_id or URL)
+    directly — Telegram fetches it, no proxy download — and only falls back to
+    downloading bytes if that fails. Returns True if a photo was sent."""
+    try:
+        await message.reply_photo(photo=banner, caption=caption, parse_mode=ParseMode.HTML)
+        return True
+    except Exception:
+        img = await _fetch_image(banner)
+        if img:
+            await message.reply_photo(photo=img, caption=caption, parse_mode=ParseMode.HTML)
+            return True
+    return False
+
+
 def _log_conversion(context, user, api_key, result) -> None:
     """Record a link conversion to metrics + the user log group (only if links were converted)."""
     if result.count <= 0:
@@ -94,15 +109,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(msg.NOT_REGISTERED_MESSAGE, parse_mode="HTML")
         return
 
-    # "set_image" reply sets a banner from a replied-to photo
+    # "set_image" reply sets a banner from a replied-to photo.
+    # Store the file_id (permanent, reusable) — not file_path, which expires ~1h.
     if (
         update.message.reply_to_message
         and text == "set_image"
         and update.message.reply_to_message.photo
     ):
-        photo = await update.message.reply_to_message.photo[-1].get_file()
-        await db.update_setting_value(user.id, "banner_image", photo.file_path)
-        await db.update_setting_value(user.id, "banner_enabled", True)
+        file_id = update.message.reply_to_message.photo[-1].file_id
+        await db.set_setting(user.id, "banner_image", file_id, "banner_enabled", True)
         await update.message.reply_text(msg.BANNER_SET_SUCCESS)
         return
 
@@ -112,19 +127,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         result = await process_message(
             update.message.text_html_urled, usr["api_key"], settings
         )
-        await db.inc_messages_processed()
         await clear_processing(user.id)
 
-        if settings.get("banner_enabled") and settings.get("banner_image"):
-            img = await _fetch_image(settings["banner_image"])
-            if img:
-                await update.message.reply_photo(
-                    photo=img, caption=result.text, parse_mode=ParseMode.HTML
-                )
-                _log_conversion(context, user, usr["api_key"], result)
-                return
-        await update.message.reply_html(result.text)
+        banner = (
+            settings.get("banner_image")
+            if settings.get("banner_enabled") and settings.get("banner_image")
+            else None
+        )
+        if not (banner and await _reply_with_banner(update.message, result.text, banner)):
+            await update.message.reply_html(result.text)
+
         _log_conversion(context, user, usr["api_key"], result)
+        await db.record_processing(messages=1, links=result.count)
     except Exception as e:
         await clear_processing(user.id)
         report_error(
@@ -151,26 +165,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         settings = usr.get("settings", {})
         caption_html = update.message.caption_html_urled or ""
         result = await process_message(caption_html, usr["api_key"], settings)
-        await db.inc_messages_processed()
 
-        photo_file = await update.message.photo[-1].get_file()
-        img_url = (
+        # Resend by file_id (no download/reupload). If a banner is set, use it;
+        # Telegram fetches the banner URL/file_id directly.
+        original_id = update.message.photo[-1].file_id
+        banner = (
             settings.get("banner_image")
             if settings.get("banner_enabled") and settings.get("banner_image")
-            else photo_file.file_path
+            else None
         )
-        img = await _fetch_image(img_url)
-        if img is None:
-            img = await _fetch_image(photo_file.file_path)
+        photo_arg = banner or original_id
 
         await clear_processing(user.id)
-        await context.bot.send_photo(
-            chat_id=update.message.chat_id,
-            photo=img,
-            caption=result.text,
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            await context.bot.send_photo(
+                chat_id=update.message.chat_id,
+                photo=photo_arg,
+                caption=result.text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            # Banner unusable (bad URL etc.) — fall back to the original photo.
+            await context.bot.send_photo(
+                chat_id=update.message.chat_id,
+                photo=original_id,
+                caption=result.text,
+                parse_mode=ParseMode.HTML,
+            )
+
         _log_conversion(context, user, usr["api_key"], result)
+        await db.record_processing(messages=1, links=result.count)
     except Exception as e:
         await clear_processing(user.id)
         report_error(

@@ -65,6 +65,9 @@ class _Config:
     # Cache TTL (seconds) for channel-subscription checks to cut Telegram calls
     SUB_CACHE_TTL: int = int(os.getenv("SUB_CACHE_TTL", "300"))
 
+    # Cache TTL (seconds) for ban-status checks to cut a DB query per message
+    BAN_CACHE_TTL: int = int(os.getenv("BAN_CACHE_TTL", "60"))
+
     # Rotating file log
     LOG_DIR: str = os.getenv("LOG_DIR", "logs")
     LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")

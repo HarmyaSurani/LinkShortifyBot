@@ -1,0 +1,6 @@
+python-telegram-bot>=22.0
+motor>=3.3.0
+httpx>=0.28.1
+lxml>=5.4.0
+python-dotenv>=1.1.0
+psutil>=6.0.0

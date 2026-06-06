@@ -1,0 +1,14 @@
+[project]
+name = "linkshortify-bot"
+version = "2.0.0"
+description = "LinkShortify Telegram Bot — production-grade link shortener"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "python-telegram-bot>=22.0",
+    "motor>=3.3.0",
+    "httpx>=0.28.1",
+    "lxml>=5.4.0",
+    "python-dotenv>=1.1.0",
+    "psutil>=6.0.0",
+]

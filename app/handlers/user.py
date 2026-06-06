@@ -1,16 +1,19 @@
 """User-facing command handlers."""
 from __future__ import annotations
 
+import asyncio
+from functools import wraps
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-import messages as msg
-from config import config
-from db.database import db
-from middleware import require_registered, require_subscription
-from services.api_client import api_client
-from utils.logger import log_error, log_new_user, log_user_action
-from utils.processing import clear_processing, send_processing
+import app.messages as msg
+from app.config import config
+from app.db.database import db
+from app.core.middleware import current_user, require_registered, require_subscription
+from app.services.api_client import api_client
+from app.utils.logger import log_api_link, log_new_user, report_error
+from app.utils.processing import clear_processing, send_processing
 
 REPLY_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -33,9 +36,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     args = context.args or []
 
-    existing = await db.get_user(user.id)
-    if existing is None:
-        await log_new_user(context.bot, user.id, user.username or "", user.first_name)
+    # Record the start exactly once — logs "New User" only on the very first /start,
+    # regardless of whether they arrive via a plain /start or a deep-link API key.
+    is_new = await db.register_user_start(user.id, user.first_name, user.username or "")
+    if is_new:
+        log_new_user(context.bot, user.id, user.username or "", user.first_name)
 
     if not args:
         await update.message.reply_text(
@@ -48,7 +53,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     api_key = args[0]
     pmsg = await update.message.reply_text(msg.PROCESSING_MESSAGE)
 
-    if await db.is_banned(user.id):
+    # Run ban check and API call concurrently
+    banned, data_result = await asyncio.gather(
+        db.is_banned(user.id),
+        api_client.get_user_data(api_key),
+        return_exceptions=True,
+    )
+
+    if banned is True:
         await pmsg.delete()
         await update.message.reply_text(
             msg.BAN_MESSAGE.format(owner_contact=config.OWNER_CONTACT),
@@ -56,19 +68,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    try:
-        data = await api_client.get_user_data(api_key)
-    except Exception:
+    if isinstance(data_result, Exception) or data_result.get("status") != "success":
         await pmsg.delete()
         await update.message.reply_text(msg.API_INVALID_MESSAGE, parse_mode="HTML")
         return
 
-    if data.get("status") != "success":
-        await pmsg.delete()
-        await update.message.reply_text(msg.API_INVALID_MESSAGE, parse_mode="HTML")
-        return
-
-    # Enforce one API key → one account
     clash = await db.get_user_by_api(api_key)
     if clash and clash["telegram_id"] != user.id:
         await pmsg.delete()
@@ -81,8 +85,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await db.upsert_user(
         telegram_id=user.id,
         api_key=api_key,
-        email=data.get("email", ""),
-        site_username=data.get("username", ""),
+        email=data_result.get("email", ""),
+        site_username=data_result.get("username", ""),
         first_name=user.first_name,
         username=user.username or "",
     )
@@ -92,8 +96,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML",
         reply_markup=REPLY_KEYBOARD,
     )
-    await log_user_action(
-        context.bot, user.id, user.username or "", user.first_name, "Linked API"
+    log_api_link(
+        context.bot, user.id, user.username or "", user.first_name, api_key
     )
 
 
@@ -144,10 +148,9 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await db.delete_user(user.id)
+    # Drop any cached state so a re-link starts clean.
+    context.user_data.pop("_db_user", None)
     await update.effective_message.reply_text(msg.LOGOUT_MESSAGE, parse_mode="HTML")
-    await log_user_action(
-        context.bot, user.id, user.username or "", user.first_name, "Logout"
-    )
 
 
 # ── /account ──────────────────────────────────────────────────────────────────
@@ -158,7 +161,7 @@ async def cmd_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     await send_processing(update)
     try:
-        usr = await db.get_user(user.id)
+        usr = current_user(context)  # fetched by @require_registered — no re-query
         data = await api_client.get_user_data(usr["api_key"])
         full = data.get("full_info", {})
         keyboard = InlineKeyboardMarkup([[
@@ -183,8 +186,9 @@ async def cmd_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     except Exception as e:
         await clear_processing(user.id)
-        await log_error(
-            context.bot, user.id, user.username or "", user.first_name, "/account", e
+        report_error(
+            context.bot, e, context_info="/account",
+            user_id=user.id, username=user.username or "",
         )
         await update.effective_message.reply_text(
             msg.ERROR_MESSAGE.format(owner_contact=config.OWNER_CONTACT),
@@ -200,7 +204,7 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     await send_processing(update)
     try:
-        usr = await db.get_user(user.id)
+        usr = current_user(context)  # fetched by @require_registered — no re-query
         data = await api_client.get_user_data(usr["api_key"])
         full = data.get("full_info", {})
         stats_data = data.get("stats", {})
@@ -222,8 +226,9 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     except Exception as e:
         await clear_processing(user.id)
-        await log_error(
-            context.bot, user.id, user.username or "", user.first_name, "/balance", e
+        report_error(
+            context.bot, e, context_info="/balance",
+            user_id=user.id, username=user.username or "",
         )
         await update.effective_message.reply_text(
             msg.ERROR_MESSAGE.format(owner_contact=config.OWNER_CONTACT),
@@ -233,9 +238,21 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ── /settings ─────────────────────────────────────────────────────────────────
 
+# Only these keys may be toggled via callback data (prevents arbitrary writes
+# to settings.* through a hand-crafted callback query).
+_TOGGLEABLE = frozenset({
+    "header_enabled",
+    "footer_enabled",
+    "username_enabled",
+    "channel_enabled",
+    "hashtag_enabled",
+    "banner_enabled",
+})
+
+
 def _settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
-    def label(enabled_key: str, name: str) -> str:
-        on = settings.get(enabled_key, False)
+    def label(key: str, name: str) -> str:
+        on = settings.get(key, False)
         return f"{'❌ Disable' if on else '✅ Enable'} {name}"
 
     return InlineKeyboardMarkup([
@@ -258,8 +275,7 @@ def _settings_keyboard(settings: dict) -> InlineKeyboardMarkup:
 @require_subscription
 @require_registered
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    usr = await db.get_user(user.id)
+    usr = current_user(context)  # fetched by @require_registered — no re-query
     s = usr.get("settings", {})
 
     def disp(k: str) -> str:
@@ -293,179 +309,91 @@ async def btn_settings_toggle(
         await query.delete_message()
         return
 
-    user_id = query.from_user.id
-    usr = await db.get_user(user_id)
-    if not usr:
+    setting_key = query.data.removeprefix("toggle_")
+    if setting_key not in _TOGGLEABLE:
+        await query.answer("Unknown setting.", show_alert=True)
+        return
+
+    settings = await db.toggle_setting(query.from_user.id, setting_key)
+    if settings is None:
         await query.answer("Please link your API first.", show_alert=True)
         return
 
-    setting_key = query.data.removeprefix("toggle_")
-    await db.toggle_setting(user_id, setting_key)
-
-    usr = await db.get_user(user_id)
     try:
-        await query.edit_message_reply_markup(
-            reply_markup=_settings_keyboard(usr.get("settings", {}))
-        )
+        await query.edit_message_reply_markup(reply_markup=_settings_keyboard(settings))
     except Exception:
         pass
 
 
 # ── Customization commands ────────────────────────────────────────────────────
+#
+# Factory that generates /header, /footer, /username, /hashtag,
+# /channel_link, and /banner_image from a single template.
 
-@require_subscription
-@require_registered
-async def cmd_header(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text(
-            msg.HEADER_USAGE_MESSAGE, parse_mode="HTML"
-        )
-        return
-    if args[0] == "remove":
-        await db.update_setting_value(user.id, "header_text", "")
-        await db.update_setting_value(user.id, "header_enabled", False)
-        await update.effective_message.reply_text(
-            msg.REMOVED_SUCCESS.format(item="Header")
-        )
-        return
-    await db.update_setting_value(user.id, "header_text", " ".join(args))
-    await db.update_setting_value(user.id, "header_enabled", True)
-    await update.effective_message.reply_text(msg.ADDED_SUCCESS.format(item="Header"))
+def _make_setting_cmd(
+    field: str,
+    enabled_key: str,
+    usage_msg: str,
+    display_name: str,
+    *,
+    prefix: str = "",
+    contains: str = "",
+    multi_word: bool = False,
+):
+    @require_subscription
+    @require_registered
+    async def _handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_id = update.effective_user.id
+        args = context.args or []
+        em = update.effective_message
 
+        if not args:
+            await em.reply_text(usage_msg, parse_mode="HTML")
+            return
 
-@require_subscription
-@require_registered
-async def cmd_footer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text(
-            msg.FOOTER_USAGE_MESSAGE, parse_mode="HTML"
-        )
-        return
-    if args[0] == "remove":
-        await db.update_setting_value(user.id, "footer_text", "")
-        await db.update_setting_value(user.id, "footer_enabled", False)
-        await update.effective_message.reply_text(
-            msg.REMOVED_SUCCESS.format(item="Footer")
-        )
-        return
-    await db.update_setting_value(user.id, "footer_text", " ".join(args))
-    await db.update_setting_value(user.id, "footer_enabled", True)
-    await update.effective_message.reply_text(msg.ADDED_SUCCESS.format(item="Footer"))
+        val = args[0]
 
+        if val == "remove":
+            await db.set_setting(user_id, field, "", enabled_key, False)
+            await em.reply_text(msg.REMOVED_SUCCESS.format(item=display_name))
+            return
 
-@require_subscription
-@require_registered
-async def cmd_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text(
-            msg.USERNAME_USAGE_MESSAGE, parse_mode="HTML"
-        )
-        return
-    if args[0] == "remove":
-        await db.update_setting_value(user.id, "username_replace", "")
-        await db.update_setting_value(user.id, "username_enabled", False)
-        await update.effective_message.reply_text(
-            msg.REMOVED_SUCCESS.format(item="Username")
-        )
-        return
-    if not args[0].startswith("@"):
-        await update.effective_message.reply_text(
-            msg.MUST_START_WITH.format(item="Username", prefix="@"),
-            parse_mode="HTML",
-        )
-        return
-    await db.update_setting_value(user.id, "username_replace", args[0])
-    await db.update_setting_value(user.id, "username_enabled", True)
-    await update.effective_message.reply_text(
-        msg.ADDED_SUCCESS.format(item="Username")
-    )
+        if prefix and not val.startswith(prefix):
+            await em.reply_text(
+                msg.MUST_START_WITH.format(item=display_name, prefix=prefix),
+                parse_mode="HTML",
+            )
+            return
+
+        if contains and contains not in val:
+            await em.reply_text(
+                msg.MUST_START_WITH.format(item=display_name, prefix=contains),
+                parse_mode="HTML",
+            )
+            return
+
+        value = " ".join(args) if multi_word else val
+        await db.set_setting(user_id, field, value, enabled_key, True)
+        await em.reply_text(msg.ADDED_SUCCESS.format(item=display_name))
+
+    return _handler
 
 
-@require_subscription
-@require_registered
-async def cmd_hashtag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text(
-            msg.HASHTAG_USAGE_MESSAGE, parse_mode="HTML"
-        )
-        return
-    if args[0] == "remove":
-        await db.update_setting_value(user.id, "hashtag_replace", "")
-        await db.update_setting_value(user.id, "hashtag_enabled", False)
-        await update.effective_message.reply_text(
-            msg.REMOVED_SUCCESS.format(item="Hashtag")
-        )
-        return
-    if not args[0].startswith("#"):
-        await update.effective_message.reply_text(
-            msg.MUST_START_WITH.format(item="Hashtag", prefix="#"),
-            parse_mode="HTML",
-        )
-        return
-    await db.update_setting_value(user.id, "hashtag_replace", args[0])
-    await db.update_setting_value(user.id, "hashtag_enabled", True)
-    await update.effective_message.reply_text(
-        msg.ADDED_SUCCESS.format(item="Hashtag")
-    )
-
-
-@require_subscription
-@require_registered
-async def cmd_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text(
-            msg.CHANNEL_LINK_USAGE_MESSAGE, parse_mode="HTML"
-        )
-        return
-    if args[0] == "remove":
-        await db.update_setting_value(user.id, "channel_link", "")
-        await db.update_setting_value(user.id, "channel_enabled", False)
-        await update.effective_message.reply_text(
-            msg.REMOVED_SUCCESS.format(item="Channel Link")
-        )
-        return
-    if "t.me" not in args[0]:
-        await update.effective_message.reply_text(
-            msg.MUST_START_WITH.format(item="Channel Link", prefix="t.me"),
-            parse_mode="HTML",
-        )
-        return
-    await db.update_setting_value(user.id, "channel_link", args[0])
-    await db.update_setting_value(user.id, "channel_enabled", True)
-    await update.effective_message.reply_text(
-        msg.ADDED_SUCCESS.format(item="Channel Link")
-    )
-
-
-@require_subscription
-@require_registered
-async def cmd_banner_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    args = context.args or []
-    if not args:
-        await update.effective_message.reply_text(
-            msg.BANNER_IMAGE_USAGE_MESSAGE, parse_mode="HTML"
-        )
-        return
-    if args[0] == "remove":
-        await db.update_setting_value(user.id, "banner_image", "")
-        await db.update_setting_value(user.id, "banner_enabled", False)
-        await update.effective_message.reply_text(
-            msg.REMOVED_SUCCESS.format(item="Banner Image")
-        )
-        return
-    await db.update_setting_value(user.id, "banner_image", args[0])
-    await db.update_setting_value(user.id, "banner_enabled", True)
-    await update.effective_message.reply_text(
-        msg.ADDED_SUCCESS.format(item="Banner Image")
-    )
+cmd_header = _make_setting_cmd(
+    "header_text", "header_enabled", msg.HEADER_USAGE_MESSAGE, "Header", multi_word=True
+)
+cmd_footer = _make_setting_cmd(
+    "footer_text", "footer_enabled", msg.FOOTER_USAGE_MESSAGE, "Footer", multi_word=True
+)
+cmd_username = _make_setting_cmd(
+    "username_replace", "username_enabled", msg.USERNAME_USAGE_MESSAGE, "Username", prefix="@"
+)
+cmd_hashtag = _make_setting_cmd(
+    "hashtag_replace", "hashtag_enabled", msg.HASHTAG_USAGE_MESSAGE, "Hashtag", prefix="#"
+)
+cmd_channel_link = _make_setting_cmd(
+    "channel_link", "channel_enabled", msg.CHANNEL_LINK_USAGE_MESSAGE, "Channel Link", contains="t.me"
+)
+cmd_banner_image = _make_setting_cmd(
+    "banner_image", "banner_enabled", msg.BANNER_IMAGE_USAGE_MESSAGE, "Banner Image"
+)

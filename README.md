@@ -26,29 +26,42 @@ A production-grade Telegram bot that automatically shortens links through [links
 ## Architecture
 
 ```
-bot.py                  — Entry point, handler registration
-config.py               — Centralized env-var configuration
-messages.py             — All user-facing strings
-middleware.py           — Decorators: subscription, auth, admin checks
+run.py                    — Entry point (python run.py)
 
-handlers/
-  user.py               — User commands and settings toggle
-  admin.py              — Admin commands (ban, broadcast, status)
-  message.py            — Text and photo message processing
+deploy/                   — Everything needed to ship it
+  install.sh              — One-command installer + systemd setup
+  Dockerfile             — Container image (MongoDB/Motor)
+  linkshortify-bot.service — systemd unit template
 
-services/
-  api_client.py         — LinkShortify HTTP API client
-  shortener.py          — Full processing pipeline
+app/                      — The application package
+  bot.py                 — Application setup, error handler, main()
+  config.py              — Centralized env-var configuration
+  messages.py            — All user-facing strings
 
-utils/
-  html_parser.py        — Link extraction from Telegram HTML
-  text_filters.py       — Regex replacements (username, hashtag, channel)
-  logger.py             — Telegram-channel logging helpers
-  processing.py         — One-active-processing-message manager
+  core/
+    middleware.py        — Decorators: subscription (cached), auth, admin
+    logging.py           — Terminal + rotating-file logging setup
+    metrics.py           — In-memory runtime counters (surfaced in /status)
 
-db/
-  __init__.py           — Motor client factory
-  database.py           — Full database abstraction layer
+  handlers/
+    __init__.py          — register_handlers(app) + metrics tap (group -1)
+    user.py              — User commands and settings toggle
+    admin.py             — Admin commands (ban, broadcast, status)
+    message.py           — Text and photo message processing
+
+  services/
+    api_client.py        — LinkShortify HTTP client (pooled, retried, timeout)
+    shortener.py         — Concurrent pipeline → ProcessResult(conversions)
+
+  utils/
+    html_parser.py       — Link extraction from Telegram HTML
+    text_filters.py      — Regex replacements (username, hashtag, channel)
+    logger.py            — Centralized escaped+retried Telegram logging
+    processing.py        — One-active-processing-message manager
+
+  db/
+    __init__.py          — Motor client factory
+    database.py          — Full database abstraction layer
 ```
 
 ---
@@ -118,6 +131,35 @@ Copy `.env.example` to `.env` and fill in all values.
 | `ADMIN_LOG_GROUP` | | Channel for admin action logs |
 | `PROCESSING_MESSAGE_ENABLED` | | Show processing message (default: `true`) |
 | `BROADCAST_BATCH_SIZE` | | Users per broadcast batch (default: `25`) |
+| `ENVIRONMENT` | | Label shown in error logs (default: `production`) |
+| `API_TIMEOUT` | | External API timeout in seconds (default: `15`) |
+| `API_RETRIES` | | Transient-failure retries for API calls (default: `2`) |
+| `SUB_CACHE_TTL` | | Subscription-check cache TTL in seconds (default: `300`) |
+| `LOG_DIR` | | Directory for the rotating log file (default: `logs`) |
+| `LOG_FILE` | | Log file name (default: `bot.log`) |
+| `LOG_LEVEL` | | Root log level (default: `INFO`) |
+
+---
+
+## Logging
+
+The bot logs through one centralized funnel. Every message is HTML-escaped
+before being sent with `parse_mode=HTML` (unescaped tracebacks contain
+`<module>`, `<`, `>`, `&` and make Telegram reject the message — the historic
+cause of "missing" error logs). Telegram sends are retried and never block a
+handler.
+
+**Three destinations for every error:** terminal → rotating file (`logs/bot.log`)
+→ Error Logs group. A Telegram outage can never make an error disappear.
+
+| Group | Events logged |
+|---|---|
+| **User Logs** (`USER_LOG_GROUP`) | New user (first `/start` only, deduplicated) · API linked (masked key) · Link conversion (type, count, original→short) |
+| **Error Logs** (`ERROR_LOG_GROUP`) | Every handler exception, background-task exception, API/DB error — with stack trace, source `file:line`, user, action, and environment |
+| **Admin Logs** (`ADMIN_LOG_GROUP`) | Ban · Unban · Broadcast started (content summary) · Broadcast completed (success/failed/blocked/duration) · Status |
+
+New-user events are deduplicated at the database level — a user document is
+created on first contact, so the "New User" message fires exactly once, ever.
 
 ---
 
@@ -134,7 +176,7 @@ git clone <repo>
 cd linkshortify-master
 cp .env.example .env
 # Edit .env with your credentials
-sudo bash install.sh
+sudo bash deploy/install.sh
 ```
 
 This will create a virtual environment, install dependencies, and install + start a systemd service.
@@ -147,14 +189,21 @@ source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 # Edit .env
-python bot.py
+python run.py
+```
+
+### Docker
+
+```bash
+docker build -f deploy/Dockerfile -t linkshortify-bot .
+docker run --env-file .env linkshortify-bot
 ```
 
 ---
 
 ## Deployment (systemd)
 
-After `sudo bash install.sh`:
+After `sudo bash deploy/install.sh`:
 
 ```bash
 # Check status
@@ -172,10 +221,10 @@ sudo systemctl stop linkshortify-bot
 
 ### Manual systemd setup
 
-Edit `linkshortify-bot.service`, replace `YOUR_USER` and the paths, then:
+Edit `deploy/linkshortify-bot.service`, replace `YOUR_USER` and the paths, then:
 
 ```bash
-sudo cp linkshortify-bot.service /etc/systemd/system/
+sudo cp deploy/linkshortify-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable linkshortify-bot
 sudo systemctl start linkshortify-bot

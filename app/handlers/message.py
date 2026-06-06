@@ -1,15 +1,14 @@
 """Text and media message handlers."""
 from __future__ import annotations
 
-import httpx
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-import messages as msg
-from config import config
-from db.database import db
-from handlers.user import (
+import app.messages as msg
+from app.config import config
+from app.db.database import db
+from app.handlers.user import (
     REPLY_KEYBOARD,
     cmd_about,
     cmd_api,
@@ -26,10 +25,12 @@ from handlers.user import (
     cmd_username,
     cmd_account,
 )
-from middleware import require_subscription
-from services.shortener import process_message
-from utils.logger import log_error, log_user_action
-from utils.processing import clear_processing, send_processing
+from app.core.metrics import metrics
+from app.core.middleware import require_subscription
+from app.services.api_client import get_http
+from app.services.shortener import process_message
+from app.utils.logger import log_link_conversion, report_error
+from app.utils.processing import clear_processing, send_processing
 
 # Maps keyboard button labels to their handler functions
 _BUTTON_MAP = {
@@ -52,14 +53,29 @@ _BUTTON_MAP = {
 
 async def _fetch_image(url: str) -> bytes | None:
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url)
+        resp = await get_http().get(url)
         ct = resp.headers.get("content-type", "")
         if resp.status_code == 200 and "image/" in ct:
             return resp.content
     except Exception:
         pass
     return None
+
+
+def _log_conversion(context, user, api_key, result) -> None:
+    """Record a link conversion to metrics + the user log group (only if links were converted)."""
+    if result.count <= 0:
+        return
+    metrics.inc_links(result.count)
+    log_link_conversion(
+        context.bot,
+        user.id,
+        user.username or "",
+        api_key,
+        result.link_type,
+        result.count,
+        result.conversions,
+    )
 
 
 @require_subscription
@@ -93,7 +109,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_processing(update)
     try:
         settings = usr.get("settings", {})
-        processed = await process_message(
+        result = await process_message(
             update.message.text_html_urled, usr["api_key"], settings
         )
         await db.inc_messages_processed()
@@ -103,24 +119,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             img = await _fetch_image(settings["banner_image"])
             if img:
                 await update.message.reply_photo(
-                    photo=img, caption=processed, parse_mode=ParseMode.HTML
+                    photo=img, caption=result.text, parse_mode=ParseMode.HTML
                 )
+                _log_conversion(context, user, usr["api_key"], result)
                 return
-        await update.message.reply_html(processed)
-
-        await log_user_action(
-            context.bot,
-            user.id,
-            user.username or "",
-            user.first_name,
-            "Processed text",
-            text[:100],
-        )
+        await update.message.reply_html(result.text)
+        _log_conversion(context, user, usr["api_key"], result)
     except Exception as e:
         await clear_processing(user.id)
-        await log_error(
-            context.bot, user.id, user.username or "", user.first_name,
-            "handle_text", e,
+        report_error(
+            context.bot, e, context_info="handle_text",
+            user_id=user.id, username=user.username or "",
         )
         await update.message.reply_text(
             msg.ERROR_MESSAGE.format(owner_contact=config.OWNER_CONTACT),
@@ -141,9 +150,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         settings = usr.get("settings", {})
         caption_html = update.message.caption_html_urled or ""
-        processed_caption = await process_message(
-            caption_html, usr["api_key"], settings
-        )
+        result = await process_message(caption_html, usr["api_key"], settings)
         await db.inc_messages_processed()
 
         photo_file = await update.message.photo[-1].get_file()
@@ -160,21 +167,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await context.bot.send_photo(
             chat_id=update.message.chat_id,
             photo=img,
-            caption=processed_caption,
+            caption=result.text,
             parse_mode=ParseMode.HTML,
         )
-        await log_user_action(
-            context.bot,
-            user.id,
-            user.username or "",
-            user.first_name,
-            "Processed photo",
-        )
+        _log_conversion(context, user, usr["api_key"], result)
     except Exception as e:
         await clear_processing(user.id)
-        await log_error(
-            context.bot, user.id, user.username or "", user.first_name,
-            "handle_photo", e,
+        report_error(
+            context.bot, e, context_info="handle_photo",
+            user_id=user.id, username=user.username or "",
         )
         await update.message.reply_text(
             msg.ERROR_MESSAGE.format(owner_contact=config.OWNER_CONTACT),

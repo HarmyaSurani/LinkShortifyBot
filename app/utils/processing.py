@@ -9,8 +9,8 @@ from typing import Dict, Optional
 
 from telegram import Message, Update
 
-from config import config
-from messages import PROCESSING_MESSAGE
+from app.config import config
+from app.messages import PROCESSING_MESSAGE
 
 # telegram_id → active processing Message
 _active: Dict[int, Message] = {}

@@ -42,7 +42,7 @@ class _Config:
 
     CHANNEL_USERNAME: str = os.getenv("CHANNEL_USERNAME", "")
 
-    ADMINS: List[int] = _int_list("ADMINS")
+    ADMINS: frozenset = frozenset(_int_list("ADMINS"))
 
     USER_LOG_GROUP: str = os.getenv("USER_LOG_GROUP", "")
     ERROR_LOG_GROUP: str = os.getenv("ERROR_LOG_GROUP", "")
@@ -54,6 +54,24 @@ class _Config:
     BROADCAST_BATCH_SIZE: int = int(os.getenv("BROADCAST_BATCH_SIZE", "25"))
 
     OWNER_CONTACT: str = os.getenv("OWNER_CONTACT", "@LinkShortifySupport")
+
+    # ── Runtime / observability ───────────────────────────────────────────────
+    ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
+
+    # External API timeout (seconds) and transient-failure retry count
+    API_TIMEOUT: float = float(os.getenv("API_TIMEOUT", "15"))
+    API_RETRIES: int = int(os.getenv("API_RETRIES", "2"))
+
+    # Cache TTL (seconds) for channel-subscription checks to cut Telegram calls
+    SUB_CACHE_TTL: int = int(os.getenv("SUB_CACHE_TTL", "300"))
+
+    # Cache TTL (seconds) for ban-status checks to cut a DB query per message
+    BAN_CACHE_TTL: int = int(os.getenv("BAN_CACHE_TTL", "60"))
+
+    # Rotating file log
+    LOG_DIR: str = os.getenv("LOG_DIR", "logs")
+    LOG_FILE: str = os.getenv("LOG_FILE", "bot.log")
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
     BOT_VERSION: str = "2.0.0"
 

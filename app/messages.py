@@ -196,11 +196,14 @@ ADMIN_NOT_AUTHORIZED = "🚫 You are not authorized to use this command."
 BROADCAST_USAGE = (
     "Reply to a message and send /broadcast to broadcast it to all users."
 )
+BROADCAST_STARTED = "📢 <b>Broadcasting to {total} users...</b>"
 BROADCAST_REPORT = (
     "📢 <b>Broadcast Complete</b>\n\n"
     "✅ Sent: {success}\n"
     "❌ Failed: {failed}\n"
-    "👥 Total: {total}"
+    "🚫 Blocked: {blocked}\n"
+    "👥 Total: {total}\n"
+    "⏱️ Duration: {duration}s"
 )
 
 STATUS_MESSAGE = (
@@ -210,6 +213,10 @@ STATUS_MESSAGE = (
     "🔗 <b>Links Shortened:</b> {total_links}\n"
     "📨 <b>Messages Processed:</b> {total_messages}\n"
     "📢 <b>Broadcasts Sent:</b> {total_broadcasts}\n\n"
+    "<b>This session</b>\n"
+    "⚡ <b>Commands:</b> {commands}\n"
+    "🔁 <b>Links:</b> {links_session}\n"
+    "❗ <b>Errors/hour:</b> {errors_hour}\n\n"
     "🗄️ <b>MongoDB:</b> {mongo_status}\n"
     "⏱️ <b>Uptime:</b> {uptime}\n"
     "🐍 <b>Python:</b> {python_version}\n"

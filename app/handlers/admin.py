@@ -4,18 +4,34 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
 import psutil
 from telegram import Update
-from telegram.constants import ParseMode
+from telegram.error import Forbidden
 from telegram.ext import ContextTypes
 
-import messages as msg
-from config import config
-from db.database import db
-from middleware import require_admin
-from utils.logger import log_admin_action
+import app.messages as msg
+from app.config import config
+from app.core.metrics import metrics
+from app.core.middleware import require_admin
+from app.db.database import db
+from app.utils.logger import log_admin_action, report_error
+
+
+def _summarize(message) -> str:
+    """Short human summary of a message being broadcast."""
+    text = message.text or message.caption
+    if text:
+        return text[:80].replace("\n", " ")
+    if message.photo:
+        return "[photo]"
+    if message.video:
+        return "[video]"
+    if message.document:
+        return "[document]"
+    return "[media]"
 
 
 @require_admin
@@ -32,16 +48,22 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     reason = " ".join(args[1:]) or "No reason provided"
-    await db.ban_user(target_id, reason, admin.id)
+    try:
+        await db.ban_user(target_id, reason, admin.id)
+    except Exception as e:
+        report_error(context.bot, e, context_info="/ban", user_id=admin.id,
+                     username=admin.username or "")
+        await update.message.reply_text(
+            msg.ERROR_MESSAGE.format(owner_contact=config.OWNER_CONTACT), parse_mode="HTML"
+        )
+        return
+
     await update.message.reply_text(
         msg.ADMIN_BAN_SUCCESS.format(user_id=target_id, reason=reason),
         parse_mode="HTML",
     )
-    await log_admin_action(
-        context.bot,
-        admin.id,
-        admin.username or "",
-        "Ban",
+    log_admin_action(
+        context.bot, admin.id, admin.username or "", "Ban",
         f"user_id={target_id}, reason={reason}",
     )
     # Notify the banned user (best-effort)
@@ -70,11 +92,20 @@ async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Invalid user ID.", parse_mode="HTML")
         return
 
-    await db.unban_user(target_id)
+    try:
+        await db.unban_user(target_id)
+    except Exception as e:
+        report_error(context.bot, e, context_info="/unban", user_id=admin.id,
+                     username=admin.username or "")
+        await update.message.reply_text(
+            msg.ERROR_MESSAGE.format(owner_contact=config.OWNER_CONTACT), parse_mode="HTML"
+        )
+        return
+
     await update.message.reply_text(
         msg.ADMIN_UNBAN_SUCCESS.format(user_id=target_id), parse_mode="HTML"
     )
-    await log_admin_action(
+    log_admin_action(
         context.bot, admin.id, admin.username or "", "Unban", f"user_id={target_id}"
     )
     try:
@@ -96,38 +127,53 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     source = update.message.reply_to_message
+    summary = _summarize(source)
     user_ids = await db.get_all_user_ids()
     total = len(user_ids)
-    success = failed = 0
+    success = failed = blocked = 0
     batch_size = config.BROADCAST_BATCH_SIZE
+    started = time.monotonic()
+
+    # Log broadcast start (admin group)
+    log_admin_action(
+        context.bot, admin.id, admin.username or "", "Broadcast started",
+        f"total={total}, content={summary!r}",
+    )
 
     status_msg = await update.message.reply_text(
-        f"📢 Broadcasting to {total} users...", parse_mode="HTML"
+        msg.BROADCAST_STARTED.format(total=total), parse_mode="HTML"
     )
 
-    for i in range(0, total, batch_size):
-        batch = user_ids[i : i + batch_size]
-        for uid in batch:
-            if uid == admin.id:
-                success += 1
-                continue
-            try:
-                await source.copy(chat_id=uid)
-                success += 1
-            except Exception:
-                failed += 1
-        await asyncio.sleep(1)  # respect Telegram rate limits between batches
+    try:
+        for i in range(0, total, batch_size):
+            batch = user_ids[i : i + batch_size]
+            to_send = [uid for uid in batch if uid != admin.id]
+            success += len(batch) - len(to_send)  # admin id counted as delivered
+            results = await asyncio.gather(
+                *[source.copy(chat_id=uid) for uid in to_send],
+                return_exceptions=True,
+            )
+            for r in results:
+                if isinstance(r, Forbidden):
+                    blocked += 1
+                elif isinstance(r, Exception):
+                    failed += 1
+                else:
+                    success += 1
+            await asyncio.sleep(1)  # respect Telegram rate limits between batches
+    except Exception as e:
+        report_error(context.bot, e, context_info="/broadcast", user_id=admin.id,
+                     username=admin.username or "")
 
-    await db.log_broadcast(admin.id, success, failed)
-    await log_admin_action(
-        context.bot,
-        admin.id,
-        admin.username or "",
-        "Broadcast",
-        f"success={success}, failed={failed}, total={total}",
+    duration = round(time.monotonic() - started, 1)
+    await db.log_broadcast(admin.id, success, failed + blocked)
+    log_admin_action(
+        context.bot, admin.id, admin.username or "", "Broadcast completed",
+        f"total={total}, success={success}, failed={failed}, "
+        f"blocked={blocked}, duration={duration}s",
     )
     report = msg.BROADCAST_REPORT.format(
-        success=success, failed=failed, total=total
+        success=success, failed=failed, blocked=blocked, total=total, duration=duration
     )
     try:
         await status_msg.edit_text(report, parse_mode="HTML")
@@ -137,8 +183,10 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 @require_admin
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    start_time: datetime = context.bot_data.get("start_time", datetime.utcnow())
-    delta = datetime.utcnow() - start_time
+    admin = update.effective_user
+    now = datetime.now(timezone.utc)
+    start_time: datetime = context.bot_data.get("start_time", now)
+    delta = now - start_time
     hours, rem = divmod(int(delta.total_seconds()), 3600)
     minutes, seconds = divmod(rem, 60)
     uptime_str = f"{hours}h {minutes}m {seconds}s"
@@ -146,8 +194,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     process = psutil.Process(os.getpid())
     mem_mb = process.memory_info().rss / (1024 * 1024)
 
-    stats = await db.get_stats()
-    mongo_ok = await db.ping()
+    stats, mongo_ok = await asyncio.gather(db.get_stats(), db.ping())
 
     await update.message.reply_text(
         msg.STATUS_MESSAGE.format(
@@ -156,6 +203,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             total_links=stats["total_links_shortened"],
             total_messages=stats["total_messages_processed"],
             total_broadcasts=stats["total_broadcasts"],
+            commands=metrics.commands,
+            links_session=metrics.links_converted,
+            errors_hour=metrics.errors_last_hour(),
             mongo_status="✅ Connected" if mongo_ok else "❌ Disconnected",
             uptime=uptime_str,
             python_version=sys.version.split()[0],
@@ -164,3 +214,4 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ),
         parse_mode="HTML",
     )
+    log_admin_action(context.bot, admin.id, admin.username or "", "Status")

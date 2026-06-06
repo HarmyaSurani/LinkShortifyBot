@@ -1,18 +1,19 @@
 [Unit]
 Description=LinkShortify Telegram Bot
-After=network.target mongod.service
-Wants=mongod.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=YOUR_USER
 WorkingDirectory=/path/to/linkshortify-master
-ExecStart=/path/to/linkshortify-master/.venv/bin/python /path/to/linkshortify-master/bot.py
+ExecStart=/path/to/linkshortify-master/.venv/bin/python /path/to/linkshortify-master/run.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=linkshortify-bot
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target

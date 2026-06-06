@@ -4,12 +4,27 @@ No MongoDB logic should appear in handlers or services.
 """
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Dict, List, Optional
+import asyncio
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
-from db import get_db
+from app.config import config
+from app.db import get_db
+
+log = logging.getLogger("linkshortify.db")
+
+# telegram_id -> (is_banned, expiry_monotonic). Avoids a DB query per message.
+_ban_cache: Dict[int, Tuple[bool, float]] = {}
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 _DEFAULT_SETTINGS: Dict[str, Any] = {
     "header_text": "",
@@ -37,6 +52,7 @@ class Database:
     async def ensure_indexes(self) -> None:
         await self._db.users.create_index("telegram_id", unique=True)
         await self._db.users.create_index("api_key", unique=True, sparse=True)
+        await self._db.users.create_index("created_at")  # analytics / new-user queries
         await self._db.bans.create_index("telegram_id", unique=True)
         await self._db.broadcasts.create_index("timestamp")
 
@@ -48,6 +64,38 @@ class Database:
     async def get_user_by_api(self, api_key: str) -> Optional[Dict]:
         return await self._db.users.find_one({"api_key": api_key})
 
+    async def register_user_start(
+        self, telegram_id: int, first_name: str = "", username: str = ""
+    ) -> bool:
+        """Record that a user has started the bot.
+
+        Creates a user document on first contact (independent of API linking) so
+        the 'new user' event is logged exactly once, ever. Returns True only when
+        this call inserted a brand-new document.
+        """
+        now = _now()
+        try:
+            result = await self._db.users.update_one(
+                {"telegram_id": telegram_id},
+                {
+                    "$set": {
+                        "first_name": first_name,
+                        "username": username,
+                        "updated_at": now,
+                    },
+                    "$setOnInsert": {
+                        "telegram_id": telegram_id,
+                        "settings": dict(_DEFAULT_SETTINGS),
+                        "created_at": now,
+                    },
+                },
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            # Concurrent first /start from the same user — the other call won.
+            return False
+        return result.upserted_id is not None
+
     async def upsert_user(
         self,
         telegram_id: int,
@@ -57,7 +105,7 @@ class Database:
         first_name: str = "",
         username: str = "",
     ) -> None:
-        now = datetime.utcnow()
+        now = _now()
         await self._db.users.update_one(
             {"telegram_id": telegram_id},
             {
@@ -89,17 +137,36 @@ class Database:
     ) -> None:
         await self._db.users.update_one(
             {"telegram_id": telegram_id},
-            {"$set": {f"settings.{key}": value, "updated_at": datetime.utcnow()}},
+            {"$set": {f"settings.{key}": value, "updated_at": _now()}},
         )
 
-    async def toggle_setting(self, telegram_id: int, key: str) -> bool:
-        user = await self.get_user(telegram_id)
-        if not user:
-            return False
-        current = user.get("settings", {}).get(key, False)
-        new_val = not current
-        await self.update_setting_value(telegram_id, key, new_val)
-        return new_val
+    async def toggle_setting(self, telegram_id: int, key: str) -> Optional[Dict[str, Any]]:
+        """Toggle a boolean setting. Returns the full settings dict, or None if user not found."""
+        result = await self._db.users.find_one_and_update(
+            {"telegram_id": telegram_id},
+            [{"$set": {
+                f"settings.{key}": {"$not": [f"$settings.{key}"]},
+                "updated_at": "$$NOW",
+            }}],
+            return_document=ReturnDocument.AFTER,
+            projection={"settings": 1},
+        )
+        if not result:
+            return None
+        return result.get("settings", {})
+
+    async def set_setting(
+        self, telegram_id: int, field: str, value: Any, enabled_key: str, enabled: bool
+    ) -> None:
+        """Set a setting value and its enabled flag in a single DB write."""
+        await self._db.users.update_one(
+            {"telegram_id": telegram_id},
+            {"$set": {
+                f"settings.{field}": value,
+                f"settings.{enabled_key}": enabled,
+                "updated_at": _now(),
+            }},
+        )
 
     async def get_all_user_ids(self) -> List[int]:
         cursor = self._db.users.find({}, {"telegram_id": 1, "_id": 0})
@@ -121,20 +188,28 @@ class Database:
                     "telegram_id": telegram_id,
                     "reason": reason,
                     "banned_by": banned_by,
-                    "created_at": datetime.utcnow(),
+                    "created_at": _now(),
                 }
             },
             upsert=True,
         )
+        _ban_cache[telegram_id] = (True, time.monotonic() + config.BAN_CACHE_TTL)
 
     async def unban_user(self, telegram_id: int) -> None:
         await self._db.bans.delete_one({"telegram_id": telegram_id})
+        _ban_cache[telegram_id] = (False, time.monotonic() + config.BAN_CACHE_TTL)
 
     async def is_banned(self, telegram_id: int) -> bool:
+        now = time.monotonic()
+        cached = _ban_cache.get(telegram_id)
+        if cached and cached[1] > now:
+            return cached[0]
         doc = await self._db.bans.find_one(
             {"telegram_id": telegram_id}, {"_id": 1}
         )
-        return doc is not None
+        banned = doc is not None
+        _ban_cache[telegram_id] = (banned, now + config.BAN_CACHE_TTL)
+        return banned
 
     async def get_ban(self, telegram_id: int) -> Optional[Dict]:
         return await self._db.bans.find_one({"telegram_id": telegram_id})
@@ -152,7 +227,7 @@ class Database:
                 "initiated_by": initiated_by,
                 "success_count": success,
                 "failed_count": failed,
-                "timestamp": datetime.utcnow(),
+                "timestamp": _now(),
             }
         )
 
@@ -161,28 +236,40 @@ class Database:
 
     # ── stats ─────────────────────────────────────────────────────────────────
 
-    async def inc_links_shortened(self, count: int = 1) -> None:
-        await self._db.stats.update_one(
-            {"_id": "global"},
-            {"$inc": {"total_links_shortened": count}},
-            upsert=True,
-        )
+    async def record_processing(self, messages: int = 0, links: int = 0) -> None:
+        """Best-effort combined stats write (one round trip). Never raises.
 
-    async def inc_messages_processed(self) -> None:
-        await self._db.stats.update_one(
-            {"_id": "global"},
-            {"$inc": {"total_messages_processed": 1}},
-            upsert=True,
-        )
+        Called after the user already has their reply, so a transient failure
+        only loses a counter — it can't affect the response.
+        """
+        inc: Dict[str, int] = {}
+        if messages:
+            inc["total_messages_processed"] = messages
+        if links:
+            inc["total_links_shortened"] = links
+        if not inc:
+            return
+        try:
+            await self._db.stats.update_one(
+                {"_id": "global"}, {"$inc": inc}, upsert=True
+            )
+        except Exception as exc:  # noqa: BLE001 - stats are non-critical
+            log.warning("record_processing failed: %s", exc)
 
     async def get_stats(self) -> Dict:
-        doc = await self._db.stats.find_one({"_id": "global"}) or {}
+        doc, users, bans, broadcasts = await asyncio.gather(
+            self._db.stats.find_one({"_id": "global"}),
+            self._db.users.count_documents({}),
+            self._db.bans.count_documents({}),
+            self._db.broadcasts.count_documents({}),
+        )
+        doc = doc or {}
         return {
-            "total_users": await self.count_users(),
-            "total_bans": await self.count_bans(),
+            "total_users": users,
+            "total_bans": bans,
             "total_links_shortened": doc.get("total_links_shortened", 0),
             "total_messages_processed": doc.get("total_messages_processed", 0),
-            "total_broadcasts": await self.count_broadcasts(),
+            "total_broadcasts": broadcasts,
         }
 
     # ── health ────────────────────────────────────────────────────────────────

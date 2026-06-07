@@ -34,6 +34,8 @@ REPLY_KEYBOARD = ReplyKeyboardMarkup(
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    if user is None or update.message is None:
+        return  # channel posts / service updates have no user to start
     args = context.args or []
 
     # Record the start exactly once — logs "New User" only on the very first /start,
@@ -147,7 +149,11 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    await db.delete_user(user.id)
+    if user is None:
+        return
+    # Disconnect the API account but KEEP the user record, so a later /start is
+    # never mistaken for a brand-new user (which re-spammed the user log group).
+    await db.logout_user(user.id)
     # Drop any cached state so a re-link starts clean.
     context.user_data.pop("_db_user", None)
     await update.effective_message.reply_text(msg.LOGOUT_MESSAGE, parse_mode="HTML")

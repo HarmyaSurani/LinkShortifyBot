@@ -1,6 +1,6 @@
 [project]
 name = "linkshortify-bot"
-version = "2.0.0"
+version = "2.2.0"
 description = "LinkShortify Telegram Bot — production-grade link shortener"
 readme = "README.md"
 requires-python = ">=3.13"

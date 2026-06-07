@@ -18,7 +18,7 @@ import logging
 import os
 import traceback
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Optional
 
 from telegram import Bot
 from telegram.constants import ParseMode
@@ -143,6 +143,10 @@ def log_api_link(
     )
 
 
+# Telegram caps a message at 4096 chars; leave headroom for the surrounding fields.
+_MAX_LOGGED_MESSAGE = 3500
+
+
 def log_link_conversion(
     bot: Bot,
     user_id: int,
@@ -150,15 +154,12 @@ def log_link_conversion(
     api_key: str,
     link_type: str,
     count: int,
-    conversions: Optional[List[Tuple[str, str]]] = None,
+    original_text: str = "",
 ) -> None:
-    sample = ""
-    if conversions:
-        original, short = conversions[0]
-        sample = (
-            f"🔗 <b>Original:</b> {_esc(original[:120])}\n"
-            f"✅ <b>Short:</b> {_esc(short[:120])}\n"
-        )
+    body = (original_text or "").strip()
+    if len(body) > _MAX_LOGGED_MESSAGE:
+        body = body[:_MAX_LOGGED_MESSAGE] + " …(truncated)"
+    body = _esc(body) if body else "—"
     _fire(
         config.USER_LOG_GROUP,
         (
@@ -168,7 +169,7 @@ def log_link_conversion(
             f"🗝 <b>API Key:</b> <code>{_esc(_mask_key(api_key))}</code>\n"
             f"🏷 <b>Type:</b> {_esc(link_type)}\n"
             f"🔢 <b>Links Converted:</b> {count}\n"
-            f"{sample}"
+            f"📥 <b>Message:</b>\n{body}\n"
             f"🕐 {_ts()}"
         ),
         bot,

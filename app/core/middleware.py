@@ -76,7 +76,10 @@ def require_subscription(func):
     """Check ban status and channel membership before running handler."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
+        user = update.effective_user
+        if user is None:
+            return  # channel posts / service updates carry no user — ignore
+        user_id = user.id
 
         banned, subscribed = await asyncio.gather(
             db.is_banned(user_id),
@@ -107,6 +110,8 @@ def require_registered(func):
     """Ensure the user has a linked API key, and cache the doc for the handler."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user is None:
+            return
         user = await db.get_user(update.effective_user.id)
         if not user or not user.get("api_key"):
             await update.effective_message.reply_text(
@@ -124,6 +129,8 @@ def require_admin(func):
     """Ensure the caller is in the ADMINS list."""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user is None:
+            return
         if not config.is_admin(update.effective_user.id):
             await update.effective_message.reply_text(
                 ADMIN_NOT_AUTHORIZED, parse_mode="HTML"

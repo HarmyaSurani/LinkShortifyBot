@@ -132,6 +132,25 @@ class Database:
     async def delete_user_by_api(self, api_key: str) -> None:
         await self._db.users.delete_one({"api_key": api_key})
 
+    async def logout_user(self, telegram_id: int) -> None:
+        """Disconnect the linked API account but keep the user document.
+
+        Logout used to delete the whole record, which made the next /start look
+        like a brand-new user and re-fired the 'New User' log every time. Keeping
+        the document (with created_at intact) means 'New User' is logged once,
+        ever. Settings are reset so a fresh API link starts from a clean slate.
+        """
+        await self._db.users.update_one(
+            {"telegram_id": telegram_id},
+            {
+                "$unset": {"api_key": "", "email": "", "site_username": ""},
+                "$set": {
+                    "settings": dict(_DEFAULT_SETTINGS),
+                    "updated_at": _now(),
+                },
+            },
+        )
+
     async def update_setting_value(
         self, telegram_id: int, key: str, value: Any
     ) -> None:

@@ -77,7 +77,7 @@ async def _reply_with_banner(message, caption: str, banner: str) -> bool:
     return False
 
 
-def _log_conversion(context, user, api_key, result) -> None:
+def _log_conversion(context, user, api_key, result, original_text) -> None:
     """Record a link conversion to metrics + the user log group (only if links were converted)."""
     if result.count <= 0:
         return
@@ -89,7 +89,7 @@ def _log_conversion(context, user, api_key, result) -> None:
         api_key,
         result.link_type,
         result.count,
-        result.conversions,
+        original_text,
     )
 
 
@@ -137,7 +137,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not (banner and await _reply_with_banner(update.message, result.text, banner)):
             await update.message.reply_html(result.text)
 
-        _log_conversion(context, user, usr["api_key"], result)
+        _log_conversion(context, user, usr["api_key"], result, update.message.text)
         await db.record_processing(messages=1, links=result.count)
     except Exception as e:
         await clear_processing(user.id)
@@ -193,7 +193,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 parse_mode=ParseMode.HTML,
             )
 
-        _log_conversion(context, user, usr["api_key"], result)
+        _log_conversion(context, user, usr["api_key"], result, update.message.caption or "")
         await db.record_processing(messages=1, links=result.count)
     except Exception as e:
         await clear_processing(user.id)
